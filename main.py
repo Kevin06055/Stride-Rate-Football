@@ -173,7 +173,5 @@ with video_sink:
             overlay_position_y:overlay_position_y + radar_pitch_frame_resized.shape[0],
             overlay_position_x:overlay_position_x + radar_pitch_frame_resized.shape[1]
         ] = radar_pitch_frame_resized
-        frames.append(annotated_frame)
-
-print(frames)
+        video_sink.write_frame(annotated_frame)
         
