@@ -1,10 +1,12 @@
 import supervision as sv
+from collections import defaultdict 
 from model import player,field
 from team_preprocessor import extract_crops
 from team_classifier import TeamClassifier
 from Persepctive_Transformer import ViewTransformer
 from PitchConfig import SoccerPitchConfiguration
 from PitchAnnotators import draw_pitch,draw_points_on_pitch;
+from player_motion_estimator import gait_metrics_estimator
 from Goalkeeper_resolver import resolve_goalkeepers_team_id;
 import cv2
 import numpy as np
@@ -27,6 +29,7 @@ REFEREE_ID = 3
 DEVICE = 'cuda'
 STRIDE=30
 CONFIG = SoccerPitchConfiguration()
+ESTIMATOR = gait_metrics_estimator()
 
 ##Classifier fitting for team assignment
 

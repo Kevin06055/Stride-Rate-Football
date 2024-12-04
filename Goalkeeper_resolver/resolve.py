@@ -14,6 +14,3 @@ def resolve_goalkeepers_team_id(players_detections:sv.Detections,goalkeepers_det
 
     
     return np.array(goalkeepers_team_ids)
-
-
-
