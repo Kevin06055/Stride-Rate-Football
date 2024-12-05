@@ -1,23 +1,23 @@
 import supervision as sv
-from collections import defaultdict 
-from model import player,field
+from collections import defaultdict
+from model import player, field
 from team_preprocessor import extract_crops
 from team_classifier import TeamClassifier
 from Persepctive_Transformer import ViewTransformer
 from PitchConfig import SoccerPitchConfiguration
-from PitchAnnotators import draw_pitch,draw_points_on_pitch;
+from PitchAnnotators import draw_pitch, draw_points_on_pitch
 from player_motion_estimator import gait_metrics_estimator
-from Goalkeeper_resolver import resolve_goalkeepers_team_id;
+from Goalkeeper_resolver import resolve_goalkeepers_team_id
 import cv2
 import numpy as np
-import os 
-from tqdm import tqdm 
+import os
+from tqdm import tqdm
 import warnings
 warnings.filterwarnings("ignore")
 os.environ["ONNXRUNTIME_EXECUTION_PROVIDERS"] = "[CUDAExecutionProvider]"
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
-##Configuration/Settings
+# Configuration/Settings
 SOURCE_VIDEO_PATH = '121364_0.mp4'
 TARGET_VIDEO_PATH = 'test.mp4'
 PLAYER_DETECTION_MODEL = player()
@@ -27,14 +27,15 @@ GOALKEEPER_ID = 1
 PLAYER_ID = 2
 REFEREE_ID = 3
 DEVICE = 'cuda'
-STRIDE=30
+STRIDE = 30
 CONFIG = SoccerPitchConfiguration()
-ESTIMATOR = gait_metrics_estimator()
+video_info = sv.VideoInfo.from_video_path(SOURCE_VIDEO_PATH)
+fps = video_info.fps
+ESTIMATOR = gait_metrics_estimator(frame_rate=fps)
 
-##Classifier fitting for team assignment
-
-crops = extract_crops(SOURCE_VIDEO_PATH,PLAYER_DETECTION_MODEL=PLAYER_DETECTION_MODEL,PLAYER_ID=PLAYER_ID,STRIDE=STRIDE)
-team_classifier  = TeamClassifier(device=DEVICE)
+# Classifier fitting for team assignment
+crops = extract_crops(SOURCE_VIDEO_PATH, PLAYER_DETECTION_MODEL=PLAYER_DETECTION_MODEL, PLAYER_ID=PLAYER_ID, STRIDE=STRIDE)
+team_classifier = TeamClassifier(device=DEVICE)
 team_classifier.fit(crops)
 
 ellipse_annotator = sv.EllipseAnnotator(
@@ -50,34 +51,39 @@ triangle_annotator = sv.TriangleAnnotator(
     color=sv.Color.from_hex('#FFD700'),
     base=20)
 
-##tracker Initialization
-
+# Tracker Initialization
 tracker = sv.ByteTrack()
 tracker.reset()
 
-
-##frame generator and videoSink Initialization using SuperVision
+# Frame generator and videoSink Initialization using SuperVision
 frame_generator = sv.get_video_frames_generator(SOURCE_VIDEO_PATH)
 video_info = sv.VideoInfo.from_video_path(SOURCE_VIDEO_PATH)
-video_sink  = sv.VideoSink(TARGET_VIDEO_PATH,video_info)
-frames = []
+video_sink = sv.VideoSink(TARGET_VIDEO_PATH, video_info)
+
+tracks = {
+    'players': defaultdict(dict),
+    'goalkeepers': defaultdict(dict),
+    'referee': defaultdict(dict)
+}
+
+# Processing frames
 with video_sink:
-    for frame in tqdm(frame_generator,total = video_info.total_frames):
-        result = PLAYER_DETECTION_MODEL.infer(frame,confidence=0.3)[0]
+    for frame in tqdm(frame_generator, total=video_info.total_frames):
+        result = PLAYER_DETECTION_MODEL.infer(frame, confidence=0.3)[0]
         detections = sv.Detections.from_inference(result)
 
-        ball_detections = detections[detections.class_id==BALL_ID]
+        ball_detections = detections[detections.class_id == BALL_ID]
         ball_detections.xyxy = sv.pad_boxes(xyxy=ball_detections.xyxy, px=10)
 
-        all_detections = detections[detections.class_id!=BALL_ID]
+        all_detections = detections[detections.class_id != BALL_ID]
         all_detections = all_detections.with_nms(threshold=0.5, class_agnostic=True)
         all_detections = tracker.update_with_detections(detections=all_detections)
+
         goalkeepers_detections = all_detections[all_detections.class_id == GOALKEEPER_ID]
         players_detections = all_detections[all_detections.class_id == PLAYER_ID]
         referees_detections = all_detections[all_detections.class_id == REFEREE_ID]
 
-        ##Team assigment
-        
+        # Team assignment logic for players
         players_crops = [sv.crop_image(frame, xyxy) for xyxy in players_detections.xyxy]
         players_detections.class_id = team_classifier.predict(players_crops)
 
@@ -87,35 +93,45 @@ with video_sink:
         referees_detections.class_id -= 1
 
         all_detections = sv.Detections.merge([players_detections, goalkeepers_detections, referees_detections])
-
-
         all_detections.class_id = all_detections.class_id.astype(int)
 
+        # Create the detections_dict
+        detections_dict = {
+            'tracker_id': all_detections.tracker_id.tolist(),
+            'confidence': all_detections.confidence.tolist(),
+            'class_id': all_detections.class_id.tolist()
+        }
+
+        # Call the gait_metrics_estimator here to add speed, distance, and stride_rate
+        ESTIMATOR.add_metrics(tracks=tracks, detections_dict=detections_dict)
+
+        # Annotating the frame with gait metrics (speed, distance, stride_rate)
         annotated_frame = frame.copy()
         annotated_frame = ellipse_annotator.annotate(
             scene=annotated_frame,
             detections=all_detections)
-        
+
         annotated_frame = triangle_annotator.annotate(
             scene=annotated_frame,
             detections=ball_detections)
-        
-        players_detections = sv.Detections.merge([players_detections, goalkeepers_detections])
+
+        # Draw labels for players and goalkeepers with gait metrics
         labels = [
-            f"#{tracker_id}"
-            for tracker_id
-            in all_detections.tracker_id
+            f"#{tracker_id} - Speed: {tracks['players'][tracker_id].get('speed', '1.00')} km/h\n"
+            f"Distance: {tracks['players'][tracker_id].get('distance', '0.00')} m\n"
+            f"Stride Rate: {tracks['players'][tracker_id].get('stride_rate', '0.oo')} strides/s"
+            for tracker_id in all_detections.tracker_id
         ]
         annotated_frame = label_annotator.annotate(
             scene=annotated_frame,
             detections=all_detections,
             labels=labels)
 
+        # Annotate the frame with team information (as already implemented)
         result = FIELD_DETECTION_MODEL.infer(frame, confidence=0.3)[0]
         key_points = sv.KeyPoints.from_inference(result)
 
-        # project ball, players, and referees on pitch
-
+        # Apply perspective transformation and draw radar
         filter = key_points.confidence[0] > 0.5
         frame_reference_points = key_points.xy[0][filter]
         pitch_reference_points = np.array(CONFIG.vertices)[filter]
@@ -133,7 +149,8 @@ with video_sink:
 
         referees_xy = referees_detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
         pitch_referees_xy = transformer.transform_points(points=referees_xy)
-        # Create the radar pitch and plot it
+
+        # Create radar pitch and plot points
         radar_pitch_frame = draw_pitch(CONFIG)
         radar_pitch_frame = draw_points_on_pitch(
             config=CONFIG,
@@ -176,5 +193,6 @@ with video_sink:
             overlay_position_y:overlay_position_y + radar_pitch_frame_resized.shape[0],
             overlay_position_x:overlay_position_x + radar_pitch_frame_resized.shape[1]
         ] = radar_pitch_frame_resized
+
+        # Write annotated frame to video
         video_sink.write_frame(annotated_frame)
-        
