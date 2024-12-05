@@ -16,69 +16,72 @@ class gait_metrics_estimator():
         self.frame_window = 5  # Sliding window for speed estimation
         self.frame_rate = frame_rate
 
-        self.tracks={}
-        self.metrics={}
+        self.tracks = {}
+        self.metrics = {}
 
-    def add_metrics(self, tracks, detections_dict):
+    def add_metrics(self, tracks):
         """
         Add estimated metrics (speed, distance, stride rate) to the track information.
         
         :param tracks: Dictionary containing the tracked objects.
-        :param detections_dict: Dictionary containing detection data for objects.
         """
         total_distance = {}
 
         for object_type, object_tracks in tracks.items():
-            if object_type in ["ball", "referee"]:
+            if object_type not in ["players", "goalkeepers"]:
                 continue
 
-            number_of_frames = len(object_tracks)
-            for frame_num in range(0, number_of_frames, self.frame_window):
-                last_frame = min(frame_num + self.frame_window, number_of_frames - 1)
+            for tracker_id, track_data in object_tracks.items():
 
-                for tracker_id in object_tracks[frame_num].keys():
-                    if tracker_id in detections_dict['tracker_id']:
-                        detections_idx = detections_dict['tracker_id'].index(tracker_id)
-                        
-                        confidence = detections_dict['confidence'][detections_idx]
-                        class_id = detections_dict['class_id'][detections_idx]
-                        
-                        if confidence < 0.6:
+                if tracker_id not in total_distance:
+                    total_distance[tracker_id] = 0
+
+                for frame_num in sorted(track_data.keys()):
+                    # Ensure that frame_num + frame_window exists in track_data
+                    if (frame_num + self.frame_window) not in track_data:
+                        continue  # Skip if the window extends beyond available frames
+
+                    start_position = track_data.get(frame_num, {}).get('position_transformed')
+                    end_position = track_data.get(frame_num + self.frame_window, {}).get('position_transformed')
+
+                    if not start_position or not end_position:
+                        continue
+
+                    distance_covered = measure_distance(start_position, end_position)
+                    time_elapsed = self.frame_window / self.frame_rate
+                    speed_mps = distance_covered / time_elapsed if time_elapsed > 0 else 0
+                    speed_kmph = speed_mps * 3.6
+
+                    total_distance[tracker_id] += distance_covered
+
+                    average_stride_length = 1.5  # Placeholder, you can adjust it as needed
+                    stride_rate = (speed_mps / average_stride_length) * 60 if average_stride_length > 0 else 0
+
+                    # Add metrics to the track data for the current window
+                    for i in range(frame_num, frame_num + self.frame_window):
+                        if i not in track_data:
                             continue
 
-                        start_position = object_tracks[frame_num][tracker_id].get('position_transformed', None)
-                        end_position = object_tracks[last_frame][tracker_id].get('position_transformed', None)
-
-                        if start_position is None or end_position is None:
-                            continue
-
-                        # Metrics Calculation
-                        distance_covered = measure_distance(start_position, end_position)
-                        time_elapsed = (last_frame - frame_num) / self.frame_rate
-                        speed_mps = distance_covered / time_elapsed if time_elapsed > 0 else 0
-                        speed_kmph = speed_mps * 3.6
-
-                        if object_type not in total_distance:
-                            total_distance[object_type] = {}
-
-                        if tracker_id not in total_distance[object_type]:
-                            total_distance[object_type][tracker_id] = 0
-
-                        total_distance[object_type][tracker_id] += distance_covered
-
-                        # Update metrics for each frame in the batch
-                        for frame_num_batch in range(frame_num, last_frame):
-                            if tracker_id not in object_tracks[object_type][frame_num_batch]:
-                                continue
-
-                            # Store metrics
-                            object_tracks[object_type][frame_num_batch][tracker_id]['speed'] = speed_kmph
-                            object_tracks[object_type][frame_num_batch][tracker_id]['distance'] = total_distance[object_type][tracker_id]
-
-                            # Stride rate metrics
-                            stride_length = 1.5  # Average stride length in meters
-                            stride_rate = (speed_mps / stride_length) * 60 if stride_length > 0 else 0
-                            object_tracks[object_type][frame_num_batch][tracker_id]['stride_rate'] = stride_rate
+                        track_data[i].setdefault('metrics', {})
+                        track_data[i]['metrics']['speed_kmph'] = speed_kmph/1000
+                        track_data[i]['metrics']['distance'] = total_distance[tracker_id]
+                        track_data[i]['metrics']['stride_rate'] = stride_rate
 
         self.tracks = tracks
         self.metrics = total_distance
+
+    def get_metrics(self):
+        """
+        Retrieve computed metrics.
+
+        :return: Dictionary of computed metrics for tracked objects.
+        """
+        return self.metrics
+
+    def get_tracks(self):
+        """
+        Retrieve updated tracks with metrics.
+
+        :return: Dictionary of tracks with added metrics.
+        """
+        return self.tracks

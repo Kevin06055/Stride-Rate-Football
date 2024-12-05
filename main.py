@@ -8,6 +8,7 @@ from PitchConfig import SoccerPitchConfiguration
 from PitchAnnotators import draw_pitch, draw_points_on_pitch
 from player_motion_estimator import gait_metrics_estimator
 from Goalkeeper_resolver import resolve_goalkeepers_team_id
+from utility import get_foot_position
 import cv2
 import numpy as np
 import os
@@ -68,7 +69,7 @@ tracks = {
 
 # Processing frames
 with video_sink:
-    for frame in tqdm(frame_generator, total=video_info.total_frames):
+    for frame_num,frame in enumerate(tqdm(frame_generator, total=video_info.total_frames)):
         result = PLAYER_DETECTION_MODEL.infer(frame, confidence=0.3)[0]
         detections = sv.Detections.from_inference(result)
 
@@ -94,16 +95,18 @@ with video_sink:
 
         all_detections = sv.Detections.merge([players_detections, goalkeepers_detections, referees_detections])
         all_detections.class_id = all_detections.class_id.astype(int)
+        if frame_num not in tracks['players']:
+            tracks['players'][frame_num]= {}
 
-        # Create the detections_dict
-        detections_dict = {
-            'tracker_id': all_detections.tracker_id.tolist(),
-            'confidence': all_detections.confidence.tolist(),
-            'class_id': all_detections.class_id.tolist()
-        }
-
+        
+        for tracker_id, bbox in zip(players_detections.tracker_id,players_detections.xyxy):
+            if tracker_id not in tracks['players'][frame_num]:
+                tracks['players'][frame_num][tracker_id] = {}
+            foot_position = get_foot_position(bbox)
+            frame_number = frame_num
+            tracks['players'][frame_num][tracker_id]['position_transformed'] = foot_position
         # Call the gait_metrics_estimator here to add speed, distance, and stride_rate
-        ESTIMATOR.add_metrics(tracks=tracks, detections_dict=detections_dict)
+        ESTIMATOR.add_metrics(tracks=tracks)
 
         # Annotating the frame with gait metrics (speed, distance, stride_rate)
         annotated_frame = frame.copy()
@@ -114,7 +117,8 @@ with video_sink:
         annotated_frame = triangle_annotator.annotate(
             scene=annotated_frame,
             detections=ball_detections)
-
+        print(tracks)
+        
         # Draw labels for players and goalkeepers with gait metrics
         labels = [
             f"#{tracker_id} - Speed: {tracks['players'][tracker_id].get('speed', '1.00')} km/h\n"
