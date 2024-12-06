@@ -6,7 +6,7 @@ from team_classifier import TeamClassifier
 from Persepctive_Transformer import ViewTransformer
 from PitchConfig import SoccerPitchConfiguration
 from PitchAnnotators import draw_pitch, draw_points_on_pitch
-from player_motion_estimator import gait_metrics_estimator
+from player_motion_estimator import GaitMetricsEstimator
 from Goalkeeper_resolver import resolve_goalkeepers_team_id
 from utility import get_foot_position
 import cv2
@@ -14,6 +14,8 @@ import numpy as np
 import os
 from tqdm import tqdm
 import warnings
+import numpy as np
+
 warnings.filterwarnings("ignore")
 os.environ["ONNXRUNTIME_EXECUTION_PROVIDERS"] = "[CUDAExecutionProvider]"
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -32,7 +34,7 @@ STRIDE = 30
 CONFIG = SoccerPitchConfiguration()
 video_info = sv.VideoInfo.from_video_path(SOURCE_VIDEO_PATH)
 fps = video_info.fps
-ESTIMATOR = gait_metrics_estimator(frame_rate=fps)
+ESTIMATOR = GaitMetricsEstimator(frame_rate=fps)
 
 # Classifier fitting for team assignment
 crops = extract_crops(SOURCE_VIDEO_PATH, PLAYER_DETECTION_MODEL=PLAYER_DETECTION_MODEL, PLAYER_ID=PLAYER_ID, STRIDE=STRIDE)
@@ -43,14 +45,14 @@ ellipse_annotator = sv.EllipseAnnotator(
     color=sv.ColorPalette.from_hex(['#00BFFF', '#FF1493', '#FFD700']),
     thickness=2
 )
+triangle_annotator = sv.TriangleAnnotator(
+    color=sv.Color.from_hex('#FFD700'),
+    base=20)
 label_annotator = sv.LabelAnnotator(
     color=sv.ColorPalette.from_hex(['#00BFFF', '#FF1493', '#FFD700']),
     text_color=sv.Color.from_hex('#000000'),
     text_position=sv.Position.BOTTOM_CENTER
 )
-triangle_annotator = sv.TriangleAnnotator(
-    color=sv.Color.from_hex('#FFD700'),
-    base=20)
 
 # Tracker Initialization
 tracker = sv.ByteTrack()
@@ -59,20 +61,72 @@ tracker.reset()
 # Frame generator and videoSink Initialization using SuperVision
 frame_generator = sv.get_video_frames_generator(SOURCE_VIDEO_PATH)
 video_info = sv.VideoInfo.from_video_path(SOURCE_VIDEO_PATH)
+
 video_sink = sv.VideoSink(TARGET_VIDEO_PATH, video_info)
 
+# Updated tracks structure with nested defaultdict
 tracks = {
-    'players': defaultdict(dict),
-    'goalkeepers': defaultdict(dict),
-    'referee': defaultdict(dict)
+    'players': defaultdict(lambda: defaultdict(dict)),
+    'goalkeepers': defaultdict(lambda: defaultdict(dict)),
+    'referee': defaultdict(lambda: defaultdict(dict))
 }
+
+def create_stats_overlay(frame, players_stats):
+    """
+    Create a stats overlay box in the top right corner of the frame.
+    
+    Args:
+    frame (np.ndarray): Input frame
+    players_stats (dict): Dictionary of player stats
+    
+    Returns:
+    np.ndarray: Frame with stats overlay
+    """
+    # Define overlay parameters
+    overlay_width = 250
+    overlay_height = len(players_stats) * 30 + 40
+    overlay_margin = 10
+    
+    # Create a semi-transparent overlay
+    overlay = frame.copy()
+    overlay_rect = np.zeros((overlay_height, overlay_width, 3), dtype=np.uint8)
+    
+    # Fill with semi-transparent white background
+    cv2.rectangle(overlay_rect, (0, 0), (overlay_width, overlay_height), 
+                  (255, 255, 255), -1)
+    cv2.addWeighted(overlay_rect, 0.7, np.zeros_like(overlay_rect), 0.3, 0, overlay_rect)
+    
+    # Title
+    cv2.putText(overlay_rect, "Player Stride Rates", 
+                (10, 30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 
+                0.7, (0, 0, 0), 2)
+    
+    # Add player stats
+    for i, (tracker_id, stride_rate) in enumerate(players_stats.items()):
+        text = f"Player #{tracker_id}: {stride_rate:.2f} strides/s"
+        cv2.putText(overlay_rect, text, 
+                    (10, 60 + i*30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 
+                    0.5, (0, 0, 0), 1)
+    
+    # Position overlay in top right corner
+    x_offset = frame.shape[1] - overlay_width - overlay_margin
+    y_offset = overlay_margin
+    
+    # Blend overlay with frame
+    frame[y_offset:y_offset+overlay_height, x_offset:x_offset+overlay_width] = overlay_rect
+    
+    return frame
 
 # Processing frames
 with video_sink:
-    for frame_num,frame in enumerate(tqdm(frame_generator, total=video_info.total_frames)):
+    for frame_num, frame in enumerate(tqdm(frame_generator, total=video_info.total_frames)):
+        # Detect players 
         result = PLAYER_DETECTION_MODEL.infer(frame, confidence=0.3)[0]
         detections = sv.Detections.from_inference(result)
 
+        # Ball and other detections processing
         ball_detections = detections[detections.class_id == BALL_ID]
         ball_detections.xyxy = sv.pad_boxes(xyxy=ball_detections.xyxy, px=10)
 
@@ -80,6 +134,7 @@ with video_sink:
         all_detections = all_detections.with_nms(threshold=0.5, class_agnostic=True)
         all_detections = tracker.update_with_detections(detections=all_detections)
 
+        # Separate detections by class
         goalkeepers_detections = all_detections[all_detections.class_id == GOALKEEPER_ID]
         players_detections = all_detections[all_detections.class_id == PLAYER_ID]
         referees_detections = all_detections[all_detections.class_id == REFEREE_ID]
@@ -95,43 +150,49 @@ with video_sink:
 
         all_detections = sv.Detections.merge([players_detections, goalkeepers_detections, referees_detections])
         all_detections.class_id = all_detections.class_id.astype(int)
-        if frame_num not in tracks['players']:
-            tracks['players'][frame_num]= {}
 
-        
-        for tracker_id, bbox in zip(players_detections.tracker_id,players_detections.xyxy):
-            if tracker_id not in tracks['players'][frame_num]:
-                tracks['players'][frame_num][tracker_id] = {}
+        # Annotate frame with labels
+        labels = [
+            f"#{tracker_id}"
+            for tracker_id
+            in all_detections.tracker_id
+        ]
+        annotated_frame = label_annotator.annotate(scene=frame, detections=all_detections, labels=labels)
+
+        # Update tracks with consistent tracking
+        for class_id, tracker_id, bbox in zip(all_detections.class_id, all_detections.tracker_id, all_detections.xyxy):
+            if class_id == REFEREE_ID:
+                continue
+            
             foot_position = get_foot_position(bbox)
-            frame_number = frame_num
-            tracks['players'][frame_num][tracker_id]['position_transformed'] = foot_position
-        # Call the gait_metrics_estimator here to add speed, distance, and stride_rate
+            
+            # Use tracker_id as the key to ensure consistent tracking
+            tracks['players'][frame_num][tracker_id] = {
+                'position_transformed': foot_position,
+                'class_id': class_id  # Store class_id for team identification
+            }
+
+        # Call gait metrics estimator
         ESTIMATOR.add_metrics(tracks=tracks)
 
-        # Annotating the frame with gait metrics (speed, distance, stride_rate)
-        annotated_frame = frame.copy()
-        annotated_frame = ellipse_annotator.annotate(
-            scene=annotated_frame,
-            detections=all_detections)
+        # Prepare player stats for overlay with robust metric retrieval
+        player_stats = {}
+        for tracker_id in tracks['players'][frame_num].keys():
+            # Safely access metrics across all frames for this tracker_id
+            stride_rates = [
+                frame_tracks[tracker_id].get('metrics', {}).get('stride_rate', 0.0)
+                for frame_num, frame_tracks in tracks['players'].items()
+                if tracker_id in frame_tracks and 'metrics' in frame_tracks[tracker_id]
+            ]
+            
+            # Use average stride rate if available
+            avg_stride_rate = sum(stride_rates) / len(stride_rates) if stride_rates else 0.0
+            player_stats[tracker_id] = avg_stride_rate
 
-        annotated_frame = triangle_annotator.annotate(
-            scene=annotated_frame,
-            detections=ball_detections)
-        print(tracks)
+        # Add stats overlay to the frame
+        annotated_frame = create_stats_overlay(annotated_frame, player_stats)
         
-        # Draw labels for players and goalkeepers with gait metrics
-        labels = [
-            f"#{tracker_id} - Speed: {tracks['players'][tracker_id].get('speed', '1.00')} km/h\n"
-            f"Distance: {tracks['players'][tracker_id].get('distance', '0.00')} m\n"
-            f"Stride Rate: {tracks['players'][tracker_id].get('stride_rate', '0.oo')} strides/s"
-            for tracker_id in all_detections.tracker_id
-        ]
-        annotated_frame = label_annotator.annotate(
-            scene=annotated_frame,
-            detections=all_detections,
-            labels=labels)
-
-        # Annotate the frame with team information (as already implemented)
+        # Field detection and perspective transformation
         result = FIELD_DETECTION_MODEL.infer(frame, confidence=0.3)[0]
         key_points = sv.KeyPoints.from_inference(result)
 
@@ -198,5 +259,5 @@ with video_sink:
             overlay_position_x:overlay_position_x + radar_pitch_frame_resized.shape[1]
         ] = radar_pitch_frame_resized
 
-        # Write annotated frame to video
+        # Visualize the annotated frame
         video_sink.write_frame(annotated_frame)
