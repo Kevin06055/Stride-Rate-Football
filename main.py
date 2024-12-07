@@ -1,4 +1,5 @@
 import supervision as sv
+import argparse
 from collections import defaultdict
 from model import player, field
 from team_preprocessor import extract_crops
@@ -8,13 +9,14 @@ from PitchConfig import SoccerPitchConfiguration
 from PitchAnnotators import draw_pitch, draw_points_on_pitch
 from player_motion_estimator import GaitMetricsEstimator
 from Goalkeeper_resolver import resolve_goalkeepers_team_id
-from utility import get_foot_position
+from utility import get_center_of_boxes
 import cv2
 import numpy as np
 import os
 from tqdm import tqdm
 import warnings
 import numpy as np
+from overlay_estimator import create_stats_overlay,radar_pitch_overlay
 
 warnings.filterwarnings("ignore")
 os.environ["ONNXRUNTIME_EXECUTION_PROVIDERS"] = "[CUDAExecutionProvider]"
@@ -70,55 +72,6 @@ tracks = {
     'goalkeepers': defaultdict(lambda: defaultdict(dict)),
     'referee': defaultdict(lambda: defaultdict(dict))
 }
-
-def create_stats_overlay(frame, players_stats):
-    """
-    Create a stats overlay box in the top right corner of the frame.
-    
-    Args:
-    frame (np.ndarray): Input frame
-    players_stats (dict): Dictionary of player stats
-    
-    Returns:
-    np.ndarray: Frame with stats overlay
-    """
-    # Define overlay parameters
-    overlay_width = 250
-    overlay_height = len(players_stats) * 30 + 40
-    overlay_margin = 10
-    
-    # Create a semi-transparent overlay
-    overlay = frame.copy()
-    overlay_rect = np.zeros((overlay_height, overlay_width, 3), dtype=np.uint8)
-    
-    # Fill with semi-transparent white background
-    cv2.rectangle(overlay_rect, (0, 0), (overlay_width, overlay_height), 
-                  (255, 255, 255), -1)
-    cv2.addWeighted(overlay_rect, 0.7, np.zeros_like(overlay_rect), 0.3, 0, overlay_rect)
-    
-    # Title
-    cv2.putText(overlay_rect, "Player Stride Rates", 
-                (10, 30), 
-                cv2.FONT_HERSHEY_SIMPLEX, 
-                0.7, (0, 0, 0), 2)
-    
-    # Add player stats
-    for i, (tracker_id, stride_rate) in enumerate(players_stats.items()):
-        text = f"Player #{tracker_id}: {stride_rate:.2f} strides/s"
-        cv2.putText(overlay_rect, text, 
-                    (10, 60 + i*30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 
-                    0.5, (0, 0, 0), 1)
-    
-    # Position overlay in top right corner
-    x_offset = frame.shape[1] - overlay_width - overlay_margin
-    y_offset = overlay_margin
-    
-    # Blend overlay with frame
-    frame[y_offset:y_offset+overlay_height, x_offset:x_offset+overlay_width] = overlay_rect
-    
-    return frame
-
 # Processing frames
 with video_sink:
     for frame_num, frame in enumerate(tqdm(frame_generator, total=video_info.total_frames)):
@@ -164,11 +117,10 @@ with video_sink:
             if class_id == REFEREE_ID:
                 continue
             
-            foot_position = get_foot_position(bbox)
-            
+            center_of_boxes = get_center_of_boxes(bbox)  
             # Use tracker_id as the key to ensure consistent tracking
             tracks['players'][frame_num][tracker_id] = {
-                'position_transformed': foot_position,
+                'position_transformed': center_of_boxes,
                 'class_id': class_id  # Store class_id for team identification
             }
 
@@ -184,10 +136,18 @@ with video_sink:
                 for frame_num, frame_tracks in tracks['players'].items()
                 if tracker_id in frame_tracks and 'metrics' in frame_tracks[tracker_id]
             ]
+
+            speeds = [
+                frame_tracks[tracker_id].get('metrics', {}).get('speed_kmph', 0.0)
+                for frame_num, frame_tracks in tracks['players'].items()
+                if tracker_id in frame_tracks and 'metrics' in frame_tracks[tracker_id]
+            ]
             
             # Use average stride rate if available
             avg_stride_rate = sum(stride_rates) / len(stride_rates) if stride_rates else 0.0
-            player_stats[tracker_id] = avg_stride_rate
+            avg_speed_kmph = sum(speeds) / len(speeds) if speeds else 1
+            player_stats[tracker_id] = {
+                'avg_stride_rate': avg_stride_rate}
 
         # Add stats overlay to the frame
         annotated_frame = create_stats_overlay(annotated_frame, player_stats)
@@ -214,50 +174,7 @@ with video_sink:
 
         referees_xy = referees_detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
         pitch_referees_xy = transformer.transform_points(points=referees_xy)
-
-        # Create radar pitch and plot points
-        radar_pitch_frame = draw_pitch(CONFIG)
-        radar_pitch_frame = draw_points_on_pitch(
-            config=CONFIG,
-            xy=pitch_ball_xy,
-            face_color=sv.Color.WHITE,
-            edge_color=sv.Color.BLACK,
-            radius=20,
-            pitch=radar_pitch_frame)
-        radar_pitch_frame = draw_points_on_pitch(
-            config=CONFIG,
-            xy=pitch_players_xy[players_detections.class_id == 0],
-            face_color=sv.Color.from_hex('00BFFF'),
-            edge_color=sv.Color.BLACK,
-            radius=26,
-            pitch=radar_pitch_frame)
-        radar_pitch_frame = draw_points_on_pitch(
-            config=CONFIG,
-            xy=pitch_players_xy[players_detections.class_id == 1],
-            face_color=sv.Color.from_hex('FF1493'),
-            edge_color=sv.Color.BLACK,
-            radius=26,
-            pitch=radar_pitch_frame)
-        radar_pitch_frame = draw_points_on_pitch(
-            config=CONFIG,
-            xy=pitch_referees_xy,
-            face_color=sv.Color.from_hex('FFD700'),
-            edge_color=sv.Color.BLACK,
-            radius=26,
-            pitch=radar_pitch_frame)
-
-        # Resize radar pitch to fit in the video frame
-        radar_pitch_frame_resized = cv2.resize(radar_pitch_frame, (frame.shape[1] // 3, frame.shape[0] // 3))
-
-        # Calculate the position for the radar pitch at the bottom center
-        overlay_position_x = (frame.shape[1] - radar_pitch_frame_resized.shape[1]) // 2
-        overlay_position_y = frame.shape[0] - radar_pitch_frame_resized.shape[0] - 10  # 10px from the bottom
-
-        # Overlay the radar pitch onto the annotated video frame
-        annotated_frame[
-            overlay_position_y:overlay_position_y + radar_pitch_frame_resized.shape[0],
-            overlay_position_x:overlay_position_x + radar_pitch_frame_resized.shape[1]
-        ] = radar_pitch_frame_resized
-
-        # Visualize the annotated frame
+        #radar pitch generation and overlay 
+        annotated_frame = radar_pitch_overlay(pitch_ball_xy=pitch_ball_xy,PLAYER_DETECTION=players_detections,pitch_players_xy=pitch_players_xy,pitch_refrees_xy=pitch_referees_xy,CONFIG=CONFIG,FRAME=frame,ANNOTATED_FRAME=annotated_frame)
+        # framewriting
         video_sink.write_frame(annotated_frame)

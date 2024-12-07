@@ -5,7 +5,7 @@ class GaitMetricsEstimator:
     """
     Class for estimating gait metrics like speed, distance, and stride rate for tracked objects.
     """
-    def __init__(self, frame_rate=24, stride_length=1.5, meters_per_pixel=0.05, max_speed_mps=500):
+    def __init__(self, frame_rate=24, stride_length=1.5, meters_per_pixel=0.0005, max_speed_mps=500):
         """
         Initialize the estimator with frame rate, average stride length, pixel-to-meter scaling, and normalization option.
 
