@@ -1,16 +1,14 @@
 import supervision as sv
-import argparse
 from collections import defaultdict
 from model import player, field
 from team_preprocessor import extract_crops
 from team_classifier import TeamClassifier
 from Persepctive_Transformer import ViewTransformer
 from PitchConfig import SoccerPitchConfiguration
-from PitchAnnotators import draw_pitch, draw_points_on_pitch
 from player_motion_estimator import GaitMetricsEstimator
 from Goalkeeper_resolver import resolve_goalkeepers_team_id
-from utility import get_center_of_boxes
-import cv2
+from utility import get_center_of_boxes, frames_to_video_generator
+from visual_aid import Tracker_Id_Manager,plot_stride_rate_fluctuations
 import numpy as np
 import os
 from tqdm import tqdm
@@ -24,7 +22,9 @@ os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 # Configuration/Settings
 SOURCE_VIDEO_PATH = '121364_0.mp4'
-TARGET_VIDEO_PATH = 'test.mp4'
+OUTPUT_VIDEO = 'test.mp4'
+OUTPUT_VIDEO_VISUALIZATION = 'test_VIS.mp4'
+IMAGE_FOLDER = 'frames'
 PLAYER_DETECTION_MODEL = player()
 FIELD_DETECTION_MODEL = field()
 BALL_ID = 0
@@ -34,6 +34,7 @@ REFEREE_ID = 3
 DEVICE = 'cuda'
 STRIDE = 30
 CONFIG = SoccerPitchConfiguration()
+TRACKER_ID_MANAGER = Tracker_Id_Manager()
 video_info = sv.VideoInfo.from_video_path(SOURCE_VIDEO_PATH)
 fps = video_info.fps
 ESTIMATOR = GaitMetricsEstimator(frame_rate=fps)
@@ -63,8 +64,8 @@ tracker.reset()
 # Frame generator and videoSink Initialization using SuperVision
 frame_generator = sv.get_video_frames_generator(SOURCE_VIDEO_PATH)
 video_info = sv.VideoInfo.from_video_path(SOURCE_VIDEO_PATH)
+video_sink = sv.VideoSink(OUTPUT_VIDEO, video_info)
 
-video_sink = sv.VideoSink(TARGET_VIDEO_PATH, video_info)
 
 # Updated tracks structure with nested defaultdict
 tracks = {
@@ -72,6 +73,8 @@ tracks = {
     'goalkeepers': defaultdict(lambda: defaultdict(dict)),
     'referee': defaultdict(lambda: defaultdict(dict))
 }
+
+all_players_data = defaultdict(list)
 # Processing frames
 with video_sink:
     for frame_num, frame in enumerate(tqdm(frame_generator, total=video_info.total_frames)):
@@ -104,6 +107,8 @@ with video_sink:
         all_detections = sv.Detections.merge([players_detections, goalkeepers_detections, referees_detections])
         all_detections.class_id = all_detections.class_id.astype(int)
 
+        TRACKER_ID_MANAGER.update_mapping(all_detections.tracker_id)
+        annotated_frame = ellipse_annotator.annotate(scene=frame,detections=all_detections)
         # Annotate frame with labels
         labels = [
             f"#{tracker_id}"
@@ -111,6 +116,7 @@ with video_sink:
             in all_detections.tracker_id
         ]
         annotated_frame = label_annotator.annotate(scene=frame, detections=all_detections, labels=labels)
+
 
         # Update tracks with consistent tracking
         for class_id, tracker_id, bbox in zip(all_detections.class_id, all_detections.tracker_id, all_detections.xyxy):
@@ -148,6 +154,14 @@ with video_sink:
             avg_speed_kmph = sum(speeds) / len(speeds) if speeds else 1
             player_stats[tracker_id] = {
                 'avg_stride_rate': avg_stride_rate}
+            
+        for tracker_id, stats in player_stats.items():
+            all_players_data[tracker_id].append({
+                "frame": frame_num,
+                "stride_rate": stats['avg_stride_rate'],
+                "tracker_id": tracker_id
+            })
+
 
         # Add stats overlay to the frame
         annotated_frame = create_stats_overlay(annotated_frame, player_stats)
@@ -177,4 +191,7 @@ with video_sink:
         #radar pitch generation and overlay 
         annotated_frame = radar_pitch_overlay(pitch_ball_xy=pitch_ball_xy,PLAYER_DETECTION=players_detections,pitch_players_xy=pitch_players_xy,pitch_refrees_xy=pitch_referees_xy,CONFIG=CONFIG,FRAME=frame,ANNOTATED_FRAME=annotated_frame)
         # framewriting
+
+        plot_stride_rate_fluctuations(all_players_data=all_players_data,frame_num=frame_num,active_ids=TRACKER_ID_MANAGER.get_active_ids())
         video_sink.write_frame(annotated_frame)
+frames_to_video_generator(image_folder=IMAGE_FOLDER,fps=fps,output_video_path=OUTPUT_VIDEO_VISUALIZATION)

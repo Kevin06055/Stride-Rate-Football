@@ -3,6 +3,10 @@ import numpy as np
 import supervision as sv
 from PitchAnnotators import draw_pitch,draw_points_on_pitch
 
+
+
+
+
 def create_stats_overlay(frame, players_stats):
     """
     Create a stats overlay box in the top right corner of the frame.
